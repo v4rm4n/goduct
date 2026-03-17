@@ -1,3 +1,4 @@
+// tunnel/ssh.go
 package tunnel
 
 import (
@@ -9,8 +10,6 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// sshConnect dials the SSH server and returns an authenticated client.
-// All auth logic lives in auth.go — this just uses the result.
 func sshConnect(cfg *Config) (*ssh.Client, error) {
 	authMethods, err := BuildAuthMethods(cfg)
 	if err != nil {
@@ -18,9 +17,8 @@ func sshConnect(cfg *Config) (*ssh.Client, error) {
 	}
 
 	clientCfg := &ssh.ClientConfig{
-		User: cfg.SSHUser,
-		Auth: authMethods,
-		// TODO: replace with known_hosts verification before prod use
+		User:            cfg.SSHUser,
+		Auth:            authMethods,
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 	}
 
@@ -32,9 +30,7 @@ func sshConnect(cfg *Config) (*ssh.Client, error) {
 	return client, nil
 }
 
-// Forward opens a local listener and pipes each connection through SSH
-// to remoteHost:remotePort on the other side.
-// Equivalent to: ssh -N -L localPort:remoteHost:remotePort user@sshHost
+// Forward opens a local listener and pipes connections to the remote target.
 func Forward(cfg *Config) error {
 	client, err := sshConnect(cfg)
 	if err != nil {
@@ -42,49 +38,37 @@ func Forward(cfg *Config) error {
 	}
 	defer client.Close()
 
-	listenAddr := fmt.Sprintf("%s:%s", cfg.LocalHost, cfg.LocalPort)
-	listener, err := net.Listen("tcp", listenAddr)
+	listener, err := net.Listen("tcp", cfg.BindAddr)
 	if err != nil {
-		return fmt.Errorf("local listen on %s: %w", listenAddr, err)
+		return fmt.Errorf("local listen on %s: %w", cfg.BindAddr, err)
 	}
 	defer listener.Close()
 
-	log.Printf("[goduct] ready — listening on %s", listenAddr)
+	log.Printf("[goduct] Forward: listening locally on %s -> remote %s via %s", cfg.BindAddr, cfg.TargetAddr, cfg.SSHHost)
 
 	for {
 		localConn, err := listener.Accept()
 		if err != nil {
 			return fmt.Errorf("accept: %w", err)
 		}
-
-		// Each connection gets its own goroutine — no blocking
-		go handleForward(client, localConn, cfg)
+		go handleForward(client, localConn, cfg.TargetAddr)
 	}
 }
 
-// handleForward pipes one local connection → SSH tunnel → remote target.
-func handleForward(client *ssh.Client, localConn net.Conn, cfg *Config) {
+func handleForward(client *ssh.Client, localConn net.Conn, targetAddr string) {
 	defer localConn.Close()
 
-	remoteAddr := fmt.Sprintf("%s:%s", cfg.RemoteHost, cfg.RemotePort)
-
-	// Ask the SSH server to open a channel to remoteAddr
-	remoteConn, err := client.Dial("tcp", remoteAddr)
+	remoteConn, err := client.Dial("tcp", targetAddr)
 	if err != nil {
-		log.Printf("[goduct] failed to reach %s via SSH: %v", remoteAddr, err)
+		log.Printf("[goduct] failed to reach %s via SSH: %v", targetAddr, err)
 		return
 	}
 	defer remoteConn.Close()
 
-	log.Printf("[goduct] new connection: local -> %s", remoteAddr)
-
-	// Bidirectional pipe: copy in both directions simultaneously
 	pipe(localConn, remoteConn)
 }
 
-// Reverse asks the SSH server to bind a port on its end, and for every
-// incoming connection there it dials back to localHost:localPort on our side.
-// Equivalent to: ssh -N -R remotePort:localHost:localPort user@sshHost
+// Reverse binds a port on the remote SSH server and dials back to a local target.
 func Reverse(cfg *Config) error {
 	client, err := sshConnect(cfg)
 	if err != nil {
@@ -92,59 +76,45 @@ func Reverse(cfg *Config) error {
 	}
 	defer client.Close()
 
-	// Ask the SSH *server* to listen — note: client.Listen not net.Listen
-	remoteAddr := fmt.Sprintf("0.0.0.0:%s", cfg.RemotePort)
-	listener, err := client.Listen("tcp", remoteAddr)
+	listener, err := client.Listen("tcp", cfg.BindAddr)
 	if err != nil {
-		return fmt.Errorf("remote listen on %s: %w", remoteAddr, err)
+		return fmt.Errorf("remote listen on %s: %w", cfg.BindAddr, err)
 	}
 	defer listener.Close()
 
-	log.Printf("[goduct] ready — remote port %s -> %s:%s",
-		cfg.RemotePort, cfg.LocalHost, cfg.LocalPort)
+	log.Printf("[goduct] Reverse: remote server listening on %s -> local %s via %s", cfg.BindAddr, cfg.TargetAddr, cfg.SSHHost)
 
 	for {
 		remoteConn, err := listener.Accept()
 		if err != nil {
 			return fmt.Errorf("accept: %w", err)
 		}
-
-		go handleReverse(remoteConn, cfg)
+		go handleReverse(remoteConn, cfg.TargetAddr)
 	}
 }
 
-// handleReverse pipes one remote SSH connection → local target.
-func handleReverse(remoteConn net.Conn, cfg *Config) {
+func handleReverse(remoteConn net.Conn, targetAddr string) {
 	defer remoteConn.Close()
 
-	localAddr := fmt.Sprintf("%s:%s", cfg.LocalHost, cfg.LocalPort)
-
-	localConn, err := net.Dial("tcp", localAddr)
+	localConn, err := net.Dial("tcp", targetAddr)
 	if err != nil {
-		log.Printf("[goduct] failed to reach local %s: %v", localAddr, err)
+		log.Printf("[goduct] failed to reach local %s: %v", targetAddr, err)
 		return
 	}
 	defer localConn.Close()
 
-	log.Printf("[goduct] new reverse connection: remote -> %s", localAddr)
-
 	pipe(remoteConn, localConn)
 }
 
-// pipe copies data between two connections in both directions.
-// Blocks until either side closes.
 func pipe(a, b net.Conn) {
 	done := make(chan struct{}, 2)
-
 	go func() {
-		io.Copy(a, b) //nolint:errcheck
+		io.Copy(a, b)
 		done <- struct{}{}
 	}()
 	go func() {
-		io.Copy(b, a) //nolint:errcheck
+		io.Copy(b, a)
 		done <- struct{}{}
 	}()
-
-	// Wait for either direction to finish, then close both
 	<-done
 }

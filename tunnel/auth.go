@@ -1,3 +1,4 @@
+// tunnel/auth.go
 package tunnel
 
 import (
@@ -8,15 +9,11 @@ import (
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
+	"golang.org/x/term"
 )
 
-// BuildAuthMethods returns SSH auth methods based on what the user supplied.
-// Priority order:
-//  1. Explicit key file (--key)
-//  2. SSH agent ($SSH_AUTH_SOCK) — used automatically if socket exists
-//  3. Password (--password)
-//
-// At least one must succeed or the connection will fail.
+// BuildAuthMethods returns SSH auth methods.
+// Priority order: Explicit key -> SSH agent -> Default keys -> Interactive Password
 func BuildAuthMethods(cfg *Config) ([]ssh.AuthMethod, error) {
 	var methods []ssh.AuthMethod
 
@@ -29,40 +26,45 @@ func BuildAuthMethods(cfg *Config) ([]ssh.AuthMethod, error) {
 		methods = append(methods, method)
 	}
 
-	// 2. SSH agent — silent: only add if socket is available
+	// 2. SSH agent
 	if agentMethod := authFromAgent(); agentMethod != nil {
 		methods = append(methods, agentMethod)
 	}
 
-	// 3. If neither key nor agent, try default key locations
+	// 3. Default key locations
 	if len(methods) == 0 {
 		for _, defaultKey := range defaultKeyPaths() {
 			method, err := authFromKeyFile(defaultKey)
 			if err == nil {
 				methods = append(methods, method)
-				break // first one that loads wins
+				break
 			}
 		}
 	}
 
-	// 4. Password — last resort
-	if cfg.Password != "" {
-		methods = append(methods, ssh.Password(cfg.Password))
-	}
+	// 4. Interactive Password fallback
+	// This callback is only executed by the SSH client if keys/agent fail
+	// and the server explicitly requests a password.
+	interactivePassword := ssh.PasswordCallback(func() (secret string, err error) {
+		fmt.Fprintf(os.Stderr, "Password for %s@%s: ", cfg.SSHUser, cfg.SSHHost)
 
-	if len(methods) == 0 {
-		return nil, fmt.Errorf(
-			"no auth method available — provide --key, --password, or run ssh-agent",
-		)
-	}
+		// ReadPassword hides input natively
+		bytePassword, err := term.ReadPassword(int(os.Stdin.Fd()))
+		fmt.Fprintln(os.Stderr) // Print a newline after they hit enter
+
+		if err != nil {
+			return "", err
+		}
+		return string(bytePassword), nil
+	})
+
+	methods = append(methods, interactivePassword)
 
 	return methods, nil
 }
 
 // authFromKeyFile reads a PEM private key from disk and returns a Signer.
-// Supports RSA, ECDSA, and Ed25519 keys.
 func authFromKeyFile(path string) (ssh.AuthMethod, error) {
-	// Expand ~ manually — os.ReadFile won't do it
 	if len(path) > 1 && path[:2] == "~/" {
 		home, err := os.UserHomeDir()
 		if err != nil {
@@ -85,7 +87,6 @@ func authFromKeyFile(path string) (ssh.AuthMethod, error) {
 }
 
 // authFromAgent connects to the running SSH agent via $SSH_AUTH_SOCK.
-// Returns nil (not an error) if no agent is available — it's optional.
 func authFromAgent() ssh.AuthMethod {
 	sock := os.Getenv("SSH_AUTH_SOCK")
 	if sock == "" {
@@ -94,21 +95,20 @@ func authFromAgent() ssh.AuthMethod {
 
 	conn, err := net.Dial("unix", sock)
 	if err != nil {
-		return nil // agent not reachable, skip silently
+		return nil
 	}
 
 	return ssh.PublicKeysCallback(agent.NewClient(conn).Signers)
 }
 
-// defaultKeyPaths returns the standard SSH key locations to try when
-// no explicit --key flag is given.
+// defaultKeyPaths returns the standard SSH key locations to try.
 func defaultKeyPaths() []string {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil
 	}
 	return []string{
-		filepath.Join(home, ".ssh", "id_ed25519"), // preferred modern key
+		filepath.Join(home, ".ssh", "id_ed25519"),
 		filepath.Join(home, ".ssh", "id_rsa"),
 		filepath.Join(home, ".ssh", "id_ecdsa"),
 	}
