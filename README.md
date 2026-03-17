@@ -18,7 +18,7 @@ I built `goduct` while diving into [**network pivoting**](https://www.geeksforge
 ## Install
 
 ```bash
-git clone [https://github.com/v4rm4n/goduct](https://github.com/v4rm4n/goduct)
+git clone https://github.com/v4rm4n/goduct
 cd goduct
 go build .
 ```
