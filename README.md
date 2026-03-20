@@ -123,6 +123,6 @@ We run curl localhost:8080 on our local machine. The traffic successfully tunnel
 
 [x] SSH reverse (ssh -R)
 
-[ ] Auto-reconnect on drop
+[x] Auto-reconnect on drop
 
 [ ] HTTP tunnel fallback (chisel-style, for when port 22 is blocked)
